@@ -1,0 +1,58 @@
+#################################################
+# ENVIRONMENT
+#################################################
+
+[Environment Selection]
+
+sele_environment = protein
+exclude_hydrogen = True
+
+#################################################
+# PROBE
+#################################################
+
+[Probe Selection]
+
+mode = ATOM
+
+# ligand projection
+selatom = resid LIGRES
+
+#################################################
+# POCKET RESIDUES
+#################################################
+
+[Residue Decomposition]
+
+residue_decomposition = True
+
+# pocket residues for field contribution
+residue_selection = around 5 angstrom of resid LIGRES
+
+#################################################
+# SOLVENT
+#################################################
+
+[Solvent]
+
+include_solvent = True
+solvent_cutoff = 10
+solvent_selection = resname WAT
+
+#################################################
+# TRAJECTORY
+#################################################
+
+[Trajectory]
+
+topology = step3_input.parm7
+trajectory = step1_prodcution.dcd
+
+#################################################
+# OUTPUT
+#################################################
+
+[Output]
+
+project_on_probe = True
+write_residue_contributions = True
