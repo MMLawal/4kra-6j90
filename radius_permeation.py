@@ -2,6 +2,7 @@
 
 import os
 import glob
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -24,28 +25,38 @@ systems = {
 
 HOLE_EXEC = "/u/mlawal/miniconda3/pkgs/hole2-2.3.1-h3b12eaf_1/bin/hole"
 
-# channel-permeation settings
-PERM_STRIDE = 10
-PORE_RADIUS = 6.0      # Å, cylindrical pore capture radius
-Z_SIDE = 10.0          # Å, defines top vs bottom reservoir relative to pore center
-OCC_RADIUS = 6.0       # Å, occupancy cylinder radius
-OCC_ZHALF = 12.0       # Å, half-length of channel occupancy region
+# analysis settings
+ANALYSIS_STRIDE = 10
+
+# cylindrical channel definition
+PORE_RADIUS = 6.0      # inner pore cylinder for crossing detection
+CHANNEL_ZHALF = 15.0   # half-length of channel cylinder for tracking
+Z_SIDE = 10.0          # reservoir threshold relative to pore center
+
+# occupancy cylinder
+OCC_RADIUS = 6.0
+OCC_ZHALF = 12.0
+
+# selections
+WATER_SEL = "(resname WAT TIP3 HOH) and name O"
+ION_SELECTIONS = {
+    "Na+":  "resname Na+",
+    "Cl-":  "resname Cl-"
+}
 
 ############################################
-# PREPARE TRAJECTORY (AUTO-IMAGE)
+# PREPARE TRAJECTORY
 ############################################
 
 def prepare_trajectory(u):
-
     protein = u.select_atoms("protein")
-    solvent_ions = u.select_atoms("not protein or resname UNL or resname UNK")
+    nonprotein = u.select_atoms("not protein")
 
     transforms = [
         unwrap(protein),
         center_in_box(protein, center="geometry", wrap=False),
-        wrap(solvent_ions, compound="residues")
+        wrap(nonprotein, compound="residues")
     ]
-
     u.trajectory.add_transformations(*transforms)
     return u
 
@@ -54,9 +65,8 @@ def prepare_trajectory(u):
 # CHANNEL RADIUS
 ############################################
 
-def compute_channel_radius(universe):
-
-    print("Running HOLE radius analysis")
+def compute_channel_radius(universe, step=10):
+    print("Running HOLE radius analysis...")
 
     H = HoleAnalysis(
         universe,
@@ -66,8 +76,7 @@ def compute_channel_radius(universe):
         executable=HOLE_EXEC
     )
 
-    H.run(step=10)
-
+    H.run(step=step)
     profiles = H.results.profiles
 
     z_all = []
@@ -81,10 +90,7 @@ def compute_channel_radius(universe):
     z_max = min(z.max() for z in z_all)
     z_common = np.linspace(z_min, z_max, 200)
 
-    r_interp = []
-    for z, r in zip(z_all, r_all):
-        r_interp.append(np.interp(z_common, z, r))
-
+    r_interp = [np.interp(z_common, z, r) for z, r in zip(z_all, r_all)]
     r_interp = np.array(r_interp)
 
     r_mean = np.mean(r_interp, axis=0)
@@ -98,94 +104,204 @@ def compute_channel_radius(universe):
 
 
 ############################################
-# WATER PERMEATION THROUGH CYLINDRICAL PORE
+# GENERIC CHANNEL TRANSPORT ANALYSIS
 ############################################
 
-def water_permeation(universe, pore_radius=PORE_RADIUS, z_side=Z_SIDE, stride=PERM_STRIDE):
+def classify_region(zrel, rxy, pore_radius=PORE_RADIUS, z_side=Z_SIDE, channel_zhalf=CHANNEL_ZHALF):
+    """
+    Region labels:
+      -1 : bottom reservoir
+       0 : channel interior
+      +1 : top reservoir
+     None: outside channel capture zone
+    """
+    if abs(zrel) > channel_zhalf or rxy > pore_radius:
+        return None
+    if zrel < -z_side:
+        return -1
+    elif zrel > z_side:
+        return +1
+    else:
+        return 0
 
+
+def channel_transport(
+    universe,
+    atom_selection,
+    label,
+    stride=ANALYSIS_STRIDE,
+    pore_radius=PORE_RADIUS,
+    channel_zhalf=CHANNEL_ZHALF,
+    z_side=Z_SIDE,
+    occ_radius=OCC_RADIUS,
+    occ_zhalf=OCC_ZHALF
+):
     protein = universe.select_atoms("protein")
-    waters = universe.select_atoms("(resname WAT TIP3 HOH) and name O")
+    atoms = universe.select_atoms(atom_selection)
 
-    # track each water molecule through the pore
+    if len(atoms) == 0:
+        print(f"WARNING: No atoms found for {label} with selection: {atom_selection}")
+        return {
+            "label": label,
+            "n_atoms": 0,
+            "time_ns": np.array([]),
+            "occupancy": np.array([]),
+            "cumulative_events": np.array([]),
+            "top_to_bottom": 0,
+            "bottom_to_top": 0,
+            "total_events": 0,
+            "net_flux": 0,
+            "mean_occupancy": 0.0
+        }
+
+    print(f"Analyzing transport for {label} ({len(atoms)} atoms)")
+
+    # state per atom index
+    # entered_from: initial reservoir side for current attempt
+    # in_channel: whether particle has entered channel interior since entry
     track = {}
-    cumulative_events = []
-    occupancy_series = []
-    time_series = []
 
-    n_events = 0
+    time_series = []
+    occupancy_series = []
+    cumulative_events = []
+
+    top_to_bottom = 0
+    bottom_to_top = 0
 
     for ts in universe.trajectory[::stride]:
-
-        # define pore center from protein COG at this frame
         center = protein.center_of_geometry()
         x0, y0, z0 = center
 
-        pos = waters.positions
-
+        pos = atoms.positions
         dx = pos[:, 0] - x0
         dy = pos[:, 1] - y0
         dz = pos[:, 2] - z0
-
         rxy = np.sqrt(dx**2 + dy**2)
 
-        # occupancy metric: waters inside channel cylinder
-        in_occ = (rxy <= OCC_RADIUS) & (np.abs(dz) <= OCC_ZHALF)
+        # occupancy inside broader analysis cylinder
+        in_occ = (rxy <= occ_radius) & (np.abs(dz) <= occ_zhalf)
         occupancy_series.append(np.sum(in_occ))
+        time_series.append(ts.time / 1000.0)
 
-        # permeation metric: only waters inside tighter pore cylinder
-        in_pore = (rxy <= pore_radius)
+        for atom, rr, zz in zip(atoms, rxy, dz):
+            pid = atom.index
+            region = classify_region(
+                zrel=zz,
+                rxy=rr,
+                pore_radius=pore_radius,
+                z_side=z_side,
+                channel_zhalf=channel_zhalf
+            )
 
-        time_series.append(ts.time / 1000.0)  # ps -> ns
+            if pid not in track:
+                track[pid] = {
+                    "entered_from": None,
+                    "in_channel": False,
+                    "last_region": None
+                }
 
-        current_ids = set()
+            state = track[pid]
 
-        for atom, rp, zrel in zip(waters, in_pore, dz):
-
-            wid = atom.index
-
-            if not rp:
-                # reset if water leaves pore region
-                if wid in track:
-                    track[wid]["entered_from"] = None
-                    track[wid]["last_region"] = None
+            # particle outside channel capture zone: keep state but do not update
+            # this avoids destroying a potential crossing due to transient wrapping/noise
+            if region is None:
+                state["last_region"] = None
                 continue
 
-            current_ids.add(wid)
+            # initialize entry from reservoir
+            if state["entered_from"] is None and region in (-1, +1):
+                state["entered_from"] = region
+                state["in_channel"] = False
 
-            if zrel < -z_side:
-                region = -1
-            elif zrel > z_side:
-                region = +1
-            else:
-                region = 0
+            # mark that particle has traversed channel interior
+            elif state["entered_from"] is not None and region == 0:
+                state["in_channel"] = True
 
-            if wid not in track:
-                track[wid] = {"entered_from": None, "last_region": None}
+            # count completed crossing only if particle came from one reservoir,
+            # passed through channel interior, and reached the opposite reservoir
+            elif (
+                state["entered_from"] is not None
+                and state["in_channel"]
+                and region in (-1, +1)
+                and region == -state["entered_from"]
+            ):
+                if state["entered_from"] == +1 and region == -1:
+                    top_to_bottom += 1
+                elif state["entered_from"] == -1 and region == +1:
+                    bottom_to_top += 1
 
-            entered_from = track[wid]["entered_from"]
-            last_region = track[wid]["last_region"]
+                # start a new possible event from current side
+                state["entered_from"] = region
+                state["in_channel"] = False
 
-            # water first appears on one side of the pore
-            if entered_from is None and region in (-1, +1):
-                track[wid]["entered_from"] = region
+            # if particle returns to its original side after entering channel, reset
+            elif (
+                state["entered_from"] is not None
+                and state["in_channel"]
+                and region == state["entered_from"]
+            ):
+                state["entered_from"] = region
+                state["in_channel"] = False
 
-            # count complete translocation
-            elif entered_from is not None and region in (-1, +1):
-                if region == -entered_from:
-                    n_events += 1
-                    # after a completed crossing, reset origin to current side
-                    track[wid]["entered_from"] = region
+            state["last_region"] = region
 
-            track[wid]["last_region"] = region
+        cumulative_events.append(top_to_bottom + bottom_to_top)
 
-        cumulative_events.append(n_events)
+    total_events = top_to_bottom + bottom_to_top
+    net_flux = bottom_to_top - top_to_bottom
 
     return {
-        "total_events": n_events,
+        "label": label,
+        "n_atoms": len(atoms),
         "time_ns": np.array(time_series),
+        "occupancy": np.array(occupancy_series),
         "cumulative_events": np.array(cumulative_events),
-        "occupancy": np.array(occupancy_series)
+        "top_to_bottom": top_to_bottom,
+        "bottom_to_top": bottom_to_top,
+        "total_events": total_events,
+        "net_flux": net_flux,
+        "mean_occupancy": float(np.mean(occupancy_series)) if occupancy_series else 0.0
     }
+
+
+############################################
+# OUTPUT HELPERS
+############################################
+
+def save_transport_summary_csv(all_results, outfile):
+    with open(outfile, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "System", "Species", "N_atoms",
+            "Top_to_Bottom", "Bottom_to_Top",
+            "Total_events", "Net_flux",
+            "Mean_occupancy"
+        ])
+        for system_label, species_dict in all_results.items():
+            for species, res in species_dict.items():
+                writer.writerow([
+                    system_label,
+                    species,
+                    res["n_atoms"],
+                    res["top_to_bottom"],
+                    res["bottom_to_top"],
+                    res["total_events"],
+                    res["net_flux"],
+                    f"{res['mean_occupancy']:.3f}"
+                ])
+
+
+def save_timeseries_csv(all_results, outfile):
+    with open(outfile, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "System", "Species", "Time_ns",
+            "Occupancy", "Cumulative_events"
+        ])
+        for system_label, species_dict in all_results.items():
+            for species, res in species_dict.items():
+                for t, occ, ce in zip(res["time_ns"], res["occupancy"], res["cumulative_events"]):
+                    writer.writerow([system_label, species, t, occ, ce])
 
 
 ############################################
@@ -193,32 +309,44 @@ def water_permeation(universe, pore_radius=PORE_RADIUS, z_side=Z_SIDE, stride=PE
 ############################################
 
 radius_profiles = {}
-permeation_results = {}
+transport_results = {}
 
 for label, folder in systems.items():
-
     print("\n==============================")
     print("Analyzing", label)
     print("==============================")
 
     path = os.path.join(BASE_DIR, folder)
-
     top = os.path.join(path, "step3_input.parm7")
     traj = sorted(glob.glob(os.path.join(path, "step*_production.dcd")))
+
+    if not os.path.exists(top):
+        raise FileNotFoundError(f"Topology not found: {top}")
+    if len(traj) == 0:
+        raise FileNotFoundError(f"No trajectories found in {path}")
 
     u = mda.Universe(top, traj)
     u = prepare_trajectory(u)
 
-    ################################
     # HOLE radius
-    ################################
-    z, r, rs, zc, rc = compute_channel_radius(u)
+    z, r, rs, zc, rc = compute_channel_radius(u, step=ANALYSIS_STRIDE)
     radius_profiles[label] = (z, r, rs, zc, rc)
 
-    ################################
-    # Water permeation
-    ################################
-    permeation_results[label] = water_permeation(u)
+    # transport analyses
+    transport_results[label] = {}
+
+    transport_results[label]["Water"] = channel_transport(
+        universe=u,
+        atom_selection=WATER_SEL,
+        label="Water"
+    )
+
+    for ion_label, ion_sel in ION_SELECTIONS.items():
+        transport_results[label][ion_label] = channel_transport(
+            universe=u,
+            atom_selection=ion_sel,
+            label=ion_label
+        )
 
 
 ############################################
@@ -226,10 +354,9 @@ for label, folder in systems.items():
 ############################################
 
 plt.figure(figsize=(7, 5))
-
 for label, (z, r, rs, zc, rc) in radius_profiles.items():
     plt.plot(z, r, label=label)
-    plt.fill_between(z, r-rs, r+rs, alpha=0.2)
+    plt.fill_between(z, r - rs, r + rs, alpha=0.2)
 
 plt.xlabel("Channel Coordinate (Å)")
 plt.ylabel("Radius (Å)")
@@ -241,61 +368,84 @@ plt.close()
 
 
 ############################################
-# PLOT TOTAL WATER PERMEATION EVENTS
+# PLOT CUMULATIVE FLUX BY SPECIES
 ############################################
 
-labels = list(permeation_results.keys())
-values = [permeation_results[k]["total_events"] for k in labels]
+species_to_plot = ["Water", "Na+", "Cl-"]
 
-plt.figure(figsize=(6, 5))
-plt.bar(labels, values)
-plt.ylabel("Complete Water Permeation Events")
-plt.title("Water Permeation Through OmpF")
-plt.tight_layout()
-plt.savefig("water_permeation_totals.png", dpi=300)
-plt.close()
-
-
-############################################
-# PLOT CUMULATIVE WATER FLUX
-############################################
-
-plt.figure(figsize=(7, 5))
-
-for label, res in permeation_results.items():
-    plt.plot(res["time_ns"], res["cumulative_events"], label=label)
-
-plt.xlabel("Time (ns)")
-plt.ylabel("Cumulative Water Permeation Events")
-plt.title("Cumulative Water Flux Through OmpF")
-plt.legend()
-plt.tight_layout()
-plt.savefig("water_permeation_cumulative.png", dpi=300)
-plt.close()
+for species in species_to_plot:
+    plt.figure(figsize=(7, 5))
+    for system_label in systems.keys():
+        res = transport_results[system_label][species]
+        if len(res["time_ns"]) > 0:
+            plt.plot(res["time_ns"], res["cumulative_events"], label=system_label)
+    plt.xlabel("Time (ns)")
+    plt.ylabel(f"Cumulative {species} Crossing Events")
+    plt.title(f"Cumulative {species} Flux Through OmpF")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{species.replace('+','plus').replace('-','minus')}_cumulative_flux.png", dpi=300)
+    plt.close()
 
 
 ############################################
-# PLOT CHANNEL WATER OCCUPANCY
+# PLOT OCCUPANCY BY SPECIES
 ############################################
 
-plt.figure(figsize=(7, 5))
-
-for label, res in permeation_results.items():
-    plt.plot(res["time_ns"], res["occupancy"], label=label)
-
-plt.xlabel("Time (ns)")
-plt.ylabel("Waters in Channel Cylinder")
-plt.title("Channel Water Occupancy")
-plt.legend()
-plt.tight_layout()
-plt.savefig("water_channel_occupancy.png", dpi=300)
-plt.close()
+for species in species_to_plot:
+    plt.figure(figsize=(7, 5))
+    for system_label in systems.keys():
+        res = transport_results[system_label][species]
+        if len(res["time_ns"]) > 0:
+            plt.plot(res["time_ns"], res["occupancy"], label=system_label)
+    plt.xlabel("Time (ns)")
+    plt.ylabel(f"{species} Count in Channel")
+    plt.title(f"Channel {species} Occupancy")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{species.replace('+','plus').replace('-','minus')}_channel_occupancy.png", dpi=300)
+    plt.close()
 
 
 ############################################
-# PRINT RESULTS
+# BAR PLOT TOTAL EVENTS
 ############################################
 
-print("\nWater Permeation Summary")
-for k, v in permeation_results.items():
-    print(f"{k}: {v['total_events']} complete crossings")
+for species in species_to_plot:
+    labels = list(systems.keys())
+    values = [transport_results[k][species]["total_events"] for k in labels]
+
+    plt.figure(figsize=(6, 5))
+    plt.bar(labels, values)
+    plt.ylabel(f"Complete {species} Crossing Events")
+    plt.title(f"{species} Permeation Through OmpF")
+    plt.tight_layout()
+    plt.savefig(f"{species.replace('+','plus').replace('-','minus')}_permeation_totals.png", dpi=300)
+    plt.close()
+
+
+############################################
+# SAVE CSV OUTPUTS
+############################################
+
+save_transport_summary_csv(transport_results, "analysis2_transport_summary.csv")
+save_timeseries_csv(transport_results, "analysis2_transport_timeseries.csv")
+
+
+############################################
+# PRINT SUMMARY
+############################################
+
+print("\n=== Analysis 2 Summary ===")
+for system_label, species_dict in transport_results.items():
+    print(f"\nSystem: {system_label}")
+    z, r, rs, zc, rc = radius_profiles[system_label]
+    print(f"  HOLE constriction: z = {zc:.2f} Å, radius = {rc:.2f} Å")
+
+    for species, res in species_dict.items():
+        print(
+            f"  {species:>5s} | atoms={res['n_atoms']:4d} | "
+            f"T->B={res['top_to_bottom']:4d} | B->T={res['bottom_to_top']:4d} | "
+            f"Total={res['total_events']:4d} | Net={res['net_flux']:4d} | "
+            f"Mean occ={res['mean_occupancy']:.2f}"
+        )
